@@ -48,7 +48,21 @@ def init_world() -> dict:
     }
 
 
-def run_world(duration_ms: int, real_time: bool = False): 
+def index_scenario(scenario) -> dict[int, list[dict]]:
+    # Group a scenario's events by time so each tick is one dict lookup instead of a scan
+    # over every event (matters for long or dense stress scenarios).
+    events: dict[int, list[dict]] = {}
+    for event_time_ms, changes in scenario:
+        events.setdefault(event_time_ms, []).append(changes)
+    return events
+
+
+def run_world(duration_ms: int, real_time: bool = False, scenario=None, on_tick=None):
+    # scenario: list of (time_ms, changes) tuples; defaults to DEMO_SCENARIO.
+    #   More scenarios live in state_machine/scenarios.py.
+    # on_tick: optional callback(time_ms, snapshot, state) called after every step,
+    #   used by the memory/stress harness in state_machine/stress/.
+    events = index_scenario(DEMO_SCENARIO if scenario is None else scenario)
     world = init_world()
     currState = State.IDLE
     transitions = []
@@ -56,10 +70,9 @@ def run_world(duration_ms: int, real_time: bool = False):
         current_time_ms = tick * TICK_MS
 
         # 1. Update what changes in the world at the specified time
-        for event_time_ms, observation in DEMO_SCENARIO:
-            if current_time_ms == event_time_ms:
-                for section, values in observation.items():
-                    world[section].update(values)
+        for observation in events.get(current_time_ms, ()):
+            for section, values in observation.items():
+                world.setdefault(section, {}).update(values)
 
         # 2. Run the state machine each tick using a snapshot of current situation
         snapshot = copy.deepcopy(world)
@@ -70,6 +83,8 @@ def run_world(duration_ms: int, real_time: bool = False):
         if newState != currState:
             transitions.append((current_time_ms, currState, newState, reason))
             currState = newState
+        if on_tick is not None:
+            on_tick(current_time_ms, snapshot, currState)
         if real_time:
             time.sleep(TICK_MS / 1000)  # Sleep for the duration of one tick in seconds
     return transitions

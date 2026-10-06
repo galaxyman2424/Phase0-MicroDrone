@@ -187,3 +187,14 @@ python3 -m pytest state_machine -v
 Runs the state machine tests.
 
 The loop uses a simulation clock, so 10 simulated seconds finish almost instantly. Call `run_world(10000, real_time=True)` to pace it in real time instead.
+
+### More scenarios and stress tests
+
+```bash
+python3 -m state_machine.scenarios                    # list the demo scenarios
+python3 -m state_machine.scenarios cart_moving_hold   # print one scenario's transitions
+python3 -m state_machine.stress                       # memory/CPU report against the 4 GB budget
+```
+
+`run_world(duration_ms, scenario=..., on_tick=...)` runs any scenario from `scenarios.py`. See [stress/README.md](stress/README.md) for the memory harness and the issues it found.
+
