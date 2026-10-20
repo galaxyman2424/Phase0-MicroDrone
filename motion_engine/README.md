@@ -1,6 +1,6 @@
 # Motion Engine — Phase 0
 
-[Phase 0 scope: Start Here](../START_HERE.md) · [Shared integration contract](../INTEGRATION_README.md)
+[Phase 0 scope: Start Here](../START_HERE.md) · [Shared integration contract](../INTEGRATION_README.md) · [Motion interfaces](INTERFACES.md) · [Comms architecture](../docs/architecture/communications.md)
 
 ## Current milestone: the synthetic loop
 
@@ -12,11 +12,12 @@ synthetic vehicle pose and its execution status, and never a mission state.
 
 ### Contract (`motion_engine/contracts.py`)
 
-| Type | Direction | What it carries |
-|---|---|---|
-| `Command` | coordinator → Motion | `command_id`, `kind`, `mission_state`, `target` (`Pose`, local ENU), `frame`, optional speed caps, `issued_ns`, `expires_ns`, `source`, `reason` |
-| `CommandAck` | Motion → coordinator, immediately | `command_id`, `accepted`, stable `reason`, `active_command_id` (what is still flying after this) |
-| `VehicleFeedback` | Motion → snapshot `vehicle` section | pose, `armed`, `airborne`, `grounded`, `emergency_descent`, `landing_settled`, active command ID/kind/target, `status`, `arrived`, errors, `timestamp_ns`, `valid` |
+Three types cross Motion's boundary: `Command` (the project's
+`MotionCommand`, coordinator → Motion), `CommandAck` (Motion's immediate
+answer) and `VehicleFeedback` (the vehicle part of `DroneState`, read every
+tick). Fields, units, publisher/subscriber, update rate, validation rules
+and example payloads for each are in **[INTERFACES.md](INTERFACES.md)**,
+the one authoritative spec. Keep it in step with `contracts.py`.
 
 One coordinator tick:
 
@@ -58,9 +59,29 @@ Rules Motion enforces:
   expires, and touchdown auto-disarms.
 - **Bad input is a result, not an exception.** Missing target or expiry, NaN
   or inf, wrong frame or schema, future timestamps and reused IDs each come
-  back as a rejected ack with a stable reason (`contracts.Reason`). A NaN,
+  back as a rejected ack with a stable reason (`contracts.Reason`; full list
+  in [INTERFACES.md](INTERFACES.md#validation-rules)). A NaN,
   inf or non-numeric `dt` passed to `step()` is ignored and logged
   (`bad_dt`, `decision = ignored_bad_dt`).
+
+### Position and velocity control
+
+Motion carries out two kinds of flight command; it never chooses them.
+
+- **Position:** `MOVE_TO`, `TRACK_TARGET`, `GOTO_DOCK_APPROACH`,
+  `DESCEND_TO_DOCK`, `TAKEOFF`, `LAND`: fly to a pose at capped speed.
+- **Velocity:** `SET_VELOCITY` with a `Velocity` (`vx_mps`, `vy_mps`,
+  `vz_mps`, `yaw_rate_dps`, world-frame ENU). It must be airborne, inside the
+  speed limits (rejected, not clamped, through `submit()`), and renewed like
+  any other non-lifecycle command; if renewals stop it expires into a hold.
+  If it would cross the geofence, the ceiling or `velocity_floor_m` (1 m,
+  landing goes through `LAND` / `DESCEND_TO_DOCK`), the drone stops at the
+  boundary and switches to a hold (`decision = hold_at_limit`).
+
+Safety's command check does not map `SET_VELOCITY` to a permission yet, so
+today it replaces a velocity command with a HOVER. That is the fail-safe
+default; `tests/test_safety_adapter.py` pins it and will fail as a reminder
+once Safety adds the mapping.
 
 ### Driven by the state machine
 
@@ -96,9 +117,11 @@ straight down, and the blocked-dock demo holds still. (In the demos,
 `DOCKED`" is a check that the scripts stay realistic.) If the state machine
 changes how it drives Motion, that file is where it shows up.
 
-Limits default to the INTEGRATION_README §5 table (`MotionLimits`): 5 / 2 m/s,
-90 deg/s, 150 m geofence, 30 m ceiling, 0.25 m / 3 deg tolerances, 1 m/s
-emergency descent. Pass the same `MotionLimits` that Safety uses.
+`MotionLimits` defaults are the
+[INTEGRATION_README §5](../INTEGRATION_README.md#5-default-configuration)
+values (that table is the source; `tests/test_safety_adapter.py` checks Motion
+and Safety agree). Motion adds one setting of its own,
+`velocity_floor_m = 1.0`. Pass the same `MotionLimits` that Safety uses.
 
 Logging goes through any object with the agreed
 `log(module, event, *, fields, state, truth, decision, t)` method
@@ -128,6 +151,8 @@ longer imports the old `mission.logging_format`.
 ```bash
 py -3 -m pytest motion_engine/tests/test_motion_stubs.py motion_engine/tests/test_motion_contract.py motion_engine/tests/test_universal_logging.py
 py -3 -m pytest motion_engine/tests/test_state_machine_alignment.py   # Motion as driven by state_machine/run_loop.py
+py -3 -m pytest motion_engine/tests/test_velocity_control.py          # SET_VELOCITY
+py -3 -m pytest motion_engine/tests/test_synthetic_generator.py       # generator flies MotionStub via the contract
 py -3 motion_engine/synthetic/generate_motion_data.py      # synthetic CSVs, see synthetic/README.md
 ```
 
@@ -214,6 +239,9 @@ A repeatable flight script takes off, holds, and lands while recording targets a
 A controlled mission abort and motor termination are distinct actions. Do not implement one ambiguous “kill switch” for both.
 
 The PX4 side (offboard connection, SITL flight script) is not part of the
-synthetic milestone. Each `MotionStub` method has a `# PHASE-1 HOOK:` comment
+synthetic milestone. Which link carries which traffic (MAVLink for the golf
+cart, operator and one-shot commands; uXRCE-DDS for the vision pipeline and
+streamed setpoints) is in
+[docs/architecture/communications.md](../docs/architecture/communications.md). Each `MotionStub` method has a `# PHASE-1 HOOK:` comment
 naming the PX4 command it becomes; `grep -n "PHASE-1 HOOK" motion_engine/motion_stubs.py`
 is the to-do list.

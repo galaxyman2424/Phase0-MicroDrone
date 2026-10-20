@@ -9,8 +9,12 @@ later ticks. This file holds the Motion Engine's half of that contract:
 * `CommandAck`      -- Motion's immediate answer: accepted or rejected, and why
 * `VehicleFeedback` -- the `vehicle` section of the snapshot, read each tick
 
-plus the value types they share (`Pose`, `MotionCommandType`), a stable set
+plus the value types they share (`Pose`, `Velocity`, `MotionCommandType`), a stable set
 of reason strings, a simulation clock, and a tiny in-memory log sink.
+
+Each interface is specified field by field (purpose, publisher, subscriber,
+units, update rate, validation rules, example payloads) in
+`motion_engine/INTERFACES.md`. Keep the two in step.
 
 PROVISIONAL LOCATION: the README suggests the shared types eventually live in
 `state_machine/contracts.py` and the logger in `state_machine/logging_format.py`,
@@ -83,6 +87,39 @@ class Pose:
         return {"x": self.x, "y": self.y, "z": self.z, "yaw_deg": self.yaw_deg}
 
 
+@dataclass(frozen=True)
+class Velocity:
+    """Commanded velocity in the same local ENU frame as `Pose`.
+
+    `vx_mps` east, `vy_mps` north, `vz_mps` up (m/s); `yaw_rate_dps` in
+    deg/s, counter-clockwise positive (same sign convention as yaw).
+    World frame, not body frame: "forward" is the caller's job to rotate.
+    """
+
+    vx_mps: float = 0.0
+    vy_mps: float = 0.0
+    vz_mps: float = 0.0
+    yaw_rate_dps: float = 0.0
+
+    def as_tuple(self) -> Tuple[float, float, float, float]:
+        return (self.vx_mps, self.vy_mps, self.vz_mps, self.yaw_rate_dps)
+
+    def is_finite(self) -> bool:
+        return all(_is_number(v) and math.isfinite(v) for v in self.as_tuple())
+
+    @property
+    def horizontal_speed_mps(self) -> float:
+        return math.hypot(self.vx_mps, self.vy_mps)
+
+    def to_dict(self) -> Dict[str, float]:
+        return {
+            "vx_mps": self.vx_mps,
+            "vy_mps": self.vy_mps,
+            "vz_mps": self.vz_mps,
+            "yaw_rate_dps": self.yaw_rate_dps,
+        }
+
+
 class MotionCommandType(str, Enum):
     """Every command kind Motion understands. One-to-one with MotionStub's
     public command methods; the string values are what goes in the logs."""
@@ -100,6 +137,7 @@ class MotionCommandType(str, Enum):
     LAND = "LAND"
     EMERGENCY_LAND = "EMERGENCY_LAND"
     STOP = "STOP"
+    SET_VELOCITY = "SET_VELOCITY"
 
 
 #: Kinds the coordinator may send through `MotionStub.submit()`.
@@ -114,6 +152,13 @@ TARGET_KINDS = frozenset({
     MotionCommandType.SET_YAW,           # only target.yaw_deg is used
     MotionCommandType.GOTO_DOCK_APPROACH,  # the approach point itself
     MotionCommandType.DESCEND_TO_DOCK,   # the pad pose
+})
+
+#: Kinds that need a `velocity` in the command instead of a target pose.
+#: Never a lifecycle kind: a velocity must always expire, or a lost
+#: coordinator would leave the drone flying in a straight line.
+VELOCITY_KINDS = frozenset({
+    MotionCommandType.SET_VELOCITY,
 })
 
 #: Entry actions / lifecycle steps (README §3). These may omit `expires_ns`;
@@ -151,6 +196,7 @@ class Reason:
     UNSUPPORTED_FRAME = "unsupported_frame"
     UNSUPPORTED_KIND = "unsupported_kind"
     MISSING_TARGET = "missing_target"
+    MISSING_VELOCITY = "missing_velocity"
     MISSING_EXPIRY = "missing_expiry"
     FUTURE_TIMESTAMP = "future_timestamp"
     COMMAND_ID_REUSED = "command_id_reused"
@@ -160,6 +206,8 @@ class Reason:
     AIRBORNE = "airborne"
     EMERGENCY_DESCENT_ACTIVE = "emergency_descent_active"
     TARGET_OUTSIDE_LIMITS = "target_outside_limits"
+    VELOCITY_OUTSIDE_LIMITS = "velocity_outside_limits"
+    NOT_AIRBORNE = "not_airborne"
 
 
 class CommandStatus(str, Enum):
@@ -193,6 +241,10 @@ class Command:
 
     `max_horizontal_speed_mps` / `max_vertical_speed_mps` can only lower the
     configured limits, never raise them.
+
+    `velocity` is used only by `VELOCITY_KINDS` (and required there); every
+    other kind ignores it, the same way kinds without a target ignore `target`. Adding it kept `schema_version = 1`: it is
+    optional with a None default, so existing producers are unaffected.
     """
 
     command_id: str
@@ -206,6 +258,7 @@ class Command:
     frame: str = FRAME_LOCAL_ENU
     max_horizontal_speed_mps: Optional[float] = None
     max_vertical_speed_mps: Optional[float] = None
+    velocity: Optional[Velocity] = None
     schema_version: int = SCHEMA_VERSION
 
     def validate(self) -> Optional[str]:
@@ -241,6 +294,15 @@ class Command:
                 return Reason.MISSING_TARGET
             if not isinstance(self.target, Pose) or not self.target.is_finite():
                 return Reason.INVALID_COMMAND
+        if kind in VELOCITY_KINDS:
+            if self.velocity is None:
+                return Reason.MISSING_VELOCITY
+            if not isinstance(self.velocity, Velocity) or not self.velocity.is_finite():
+                return Reason.INVALID_COMMAND
+        # Any other kind ignores `velocity`, exactly as HOVER ignores `target`.
+        # It must not be rejected: Safety builds its fallback HOVER/LAND with
+        # dataclasses.replace(original, ...), which carries the field over,
+        # and Motion refusing Safety's own hold would be the worst outcome.
         for cap in (self.max_horizontal_speed_mps, self.max_vertical_speed_mps):
             if cap is not None and not (_is_number(cap) and math.isfinite(cap) and cap > 0.0):
                 return Reason.INVALID_COMMAND
@@ -251,6 +313,7 @@ class Command:
         return (
             MotionCommandType(self.kind) == MotionCommandType(other.kind)
             and self.target == other.target
+            and self.velocity == other.velocity
             and self.max_horizontal_speed_mps == other.max_horizontal_speed_mps
             and self.max_vertical_speed_mps == other.max_vertical_speed_mps
         )
@@ -262,6 +325,7 @@ class Command:
             "kind": _enum_value(self.kind),
             "mission_state": self.mission_state,
             "target": self.target.to_dict() if isinstance(self.target, Pose) else None,
+            "velocity": self.velocity.to_dict() if isinstance(self.velocity, Velocity) else None,
             "frame": self.frame,
             "max_horizontal_speed_mps": self.max_horizontal_speed_mps,
             "max_vertical_speed_mps": self.max_vertical_speed_mps,
@@ -331,6 +395,9 @@ class VehicleFeedback:
     horizontal_error_m: Optional[float]
     vertical_error_m: Optional[float]
     yaw_error_deg: Optional[float]
+    #: The active SET_VELOCITY command's velocity, else None. A velocity
+    #: command has no target pose, so `target` and the error fields are None.
+    commanded_velocity: Optional[Velocity] = None
     valid: bool = True
     reason: Optional[str] = None
     source_id: str = MOTION_SOURCE_ID
@@ -360,6 +427,9 @@ class VehicleFeedback:
             "horizontal_error_m": self.horizontal_error_m,
             "vertical_error_m": self.vertical_error_m,
             "yaw_error_deg": self.yaw_error_deg,
+            "commanded_velocity": (
+                self.commanded_velocity.to_dict() if self.commanded_velocity is not None else None
+            ),
         }
 
 

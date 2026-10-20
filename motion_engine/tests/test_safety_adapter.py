@@ -15,7 +15,14 @@ if str(_REPO_ROOT) not in sys.path:
 
 import pytest
 
-from motion_engine.contracts import CONTRACT_KINDS, Command, MotionCommandType as K, Pose
+from motion_engine.contracts import (
+    CONTRACT_KINDS,
+    VELOCITY_KINDS,
+    Command,
+    MotionCommandType as K,
+    Pose,
+    Velocity,
+)
 from motion_engine.motion_stubs import MotionLimits, MotionStub
 from motion_engine.safety_adapter import check_for_motion
 from safety_layer import config
@@ -76,9 +83,32 @@ def test_motion_and_safety_use_the_same_limits():
 
 
 def test_safety_rules_on_every_kind_motion_accepts():
-    """A Motion kind Safety has no permission for would always be held."""
-    assert set(KIND_TO_ACTION) == set(CONTRACT_KINDS)
+    """A Motion kind Safety has no permission for would always be held.
+
+    SET_VELOCITY is the one known exception: Motion added it for velocity
+    control, and Safety has not mapped it to a permission yet. Until it does,
+    the next test pins the fail-safe behaviour. When Safety adds the mapping,
+    this assertion fails -- drop the `- VELOCITY_KINDS` and the next test.
+    """
+    assert set(KIND_TO_ACTION) == set(CONTRACT_KINDS) - VELOCITY_KINDS
     assert set(KIND_TO_ACTION.values()) <= set(ACTIONS)
+
+
+def test_set_velocity_is_held_until_safety_maps_it():
+    """Unmapped kind -> Safety substitutes a HOVER; Motion flies the hold."""
+    m = airborne_motion()
+    c = cmd("vel-1", K.SET_VELOCITY, 0, velocity=Velocity(2.0, 0.0, 0.0, 0.0))
+    out, decision = check_for_motion(c, ALL_OK, 0)
+    assert not decision.allowed
+    assert MotionCommandType_of(out) == K.HOVER
+    assert m.submit(out, 0).accepted
+    x0 = m.pose.x
+    m.step(0.1, now_ns=DT_NS)
+    assert m.pose.x == x0
+
+
+def MotionCommandType_of(command):
+    return K(command.kind)
 
 
 # -- pass-through ------------------------------------------------------------
